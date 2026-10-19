@@ -1,0 +1,12 @@
+# 2026-10 기준 PyPI에서 확인. 출시 2주 이상 지난 버전으로 고정.
+fastapi==0.141.1
+uvicorn==0.53.0
+redis==7.4.1
+psycopg[binary]==3.3.5
+psycopg-pool==3.3.2
+langgraph==1.2.12
+langgraph-checkpoint-postgres==3.1.2
+# MCP Python SDK: 2.x가 나왔지만 API가 크게 바뀐 메이저 버전이라, 안정적인 1.x 최신으로 고정
+mcp==1.30.0
+minio==7.2.20
+httpx==0.28.1

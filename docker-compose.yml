@@ -1,0 +1,118 @@
+# 장학금 AI 아키텍처 실습 랩
+# 아키텍처 v4의 "EC2 1대 안의 컨테이너들" + "AWS 별도 서버(RDS, S3)"를 로컬 컨테이너로 재현한다.
+#   RDS PostgreSQL -> postgres (pgvector 이미지)
+#   S3             -> minio
+#   기관 사이트     -> mock-sites (정적 파일을 주는 nginx)
+name: scholarship-lab
+
+# WHY: Python 서버 6개가 같은 이미지를 쓰고 command만 다르다.
+#      "이미지(설계도) 1개 -> 컨테이너(실행 환경) 여러 개 -> 각 컨테이너 안에 프로세스 1개"를 직접 보기 위함.
+x-backend: &backend
+  build: ./backend
+  image: scholarship-lab-backend:dev
+  env_file:
+    - path: .env.example
+    - path: .env
+      required: false
+  restart: unless-stopped
+  depends_on: &backend-deps
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    minio: { condition: service_healthy }
+
+services:
+  # ---------------- 저장소 계층 ----------------
+  postgres:
+    image: pgvector/pgvector:pg17
+    env_file: [{ path: .env.example }, { path: .env, required: false }]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    env_file: [{ path: .env.example }, { path: .env, required: false }]
+    # WHY appendonly: Stream(할 일)은 Redis가 재시작돼도 남아야 한다. Pub/Sub은 원래 저장되지 않는다.
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\" --appendonly yes"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep PONG"]
+      interval: 3s
+      retries: 20
+
+  minio:
+    # MOCK: AWS S3 대체. 공식 minio/minio 이미지가 더 이상 배포되지 않아 동일 바이너리의 커뮤니티 빌드를 고정 버전으로 사용.
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    env_file: [{ path: .env.example }, { path: .env, required: false }]
+    command: ["server", "/data", "--console-address", ":9001"]
+    ports: ["9000:9000", "9001:9001"]   # 학습용: 9000=presigned 다운로드, 9001=웹 콘솔
+    volumes: [miniodata:/data]
+    healthcheck:
+      test: ["CMD", "bash", "-c", ":> /dev/tcp/127.0.0.1/9000"]
+      interval: 3s
+      retries: 20
+
+  mock-sites:
+    # MOCK: 외부 장학금 기관 사이트. ./mock-sites/html 파일을 고치면 "공고 변경"이 된다.
+    image: nginx:1.27-alpine
+    volumes: ["./mock-sites/html:/usr/share/nginx/html:ro"]
+
+  # ---------------- 애플리케이션 계층 ----------------
+  api:
+    <<: *backend
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment: { SERVICE_NAME: api, WORKER_ID: api }
+    ports: ["8000:8000"]   # 학습용으로 열어 둠 (원본 설계에서는 Docker 내부망 전용)
+
+  outbox-relay:
+    <<: *backend
+    command: ["python", "-m", "relay.main"]
+    environment: { SERVICE_NAME: outbox-relay, WORKER_ID: outbox-relay }
+
+  crawler:
+    <<: *backend
+    command: ["python", "-m", "crawler.main"]
+    environment: { SERVICE_NAME: crawler, WORKER_ID: crawler-1 }
+    depends_on:
+      <<: *backend-deps
+      mock-sites: { condition: service_started }
+
+  mcp:
+    <<: *backend
+    command: ["python", "-m", "mcp_server.server"]
+    environment: { SERVICE_NAME: mcp, WORKER_ID: mcp }
+    depends_on:
+      mock-sites: { condition: service_started }
+      redis: { condition: service_healthy }
+
+  # WHY 서비스 2개를 명시: replicas: 2 대신 이름을 따로 줘야
+  #     "docker compose kill ai-worker-1"처럼 한 Worker만 골라 장애를 낼 수 있다.
+  ai-worker-1:
+    <<: *backend
+    command: ["python", "-m", "ai_worker.main"]
+    environment: { SERVICE_NAME: ai-worker, WORKER_ID: ai-worker-1 }
+    depends_on:
+      <<: *backend-deps
+      mcp: { condition: service_started }
+
+  ai-worker-2:
+    <<: *backend
+    command: ["python", "-m", "ai_worker.main"]
+    environment: { SERVICE_NAME: ai-worker, WORKER_ID: ai-worker-2 }
+    depends_on:
+      <<: *backend-deps
+      mcp: { condition: service_started }
+
+  web:
+    build: ./web
+    ports: ["8080:80"]   # 원본 설계의 443 대신 로컬 8080 (TLS 생략)
+    depends_on: [api]
+
+volumes:
+  pgdata:
+  redisdata:
+  miniodata:
